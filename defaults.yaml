@@ -1,0 +1,13 @@
+from: gfm
+to: html5
+standalone: true
+self-contained: true
+toc: true
+template: page.html
+css: [style.css]
+highlight-style: pygments
+html-math-method:
+  method: katex
+metadata:
+  toc-left: true
+  toc-title: Table of Contents
