@@ -187,8 +187,8 @@ class DocumentParser:
     
     def parse(self, text: str) -> Document:
         """解析文本为文档对象"""
-        # 先按页面分割
-        pages = text.replace('\n---\n', '---').split('---')
+        # 精确分割页面：只有独立成行的 --- 才是页面分隔符
+        pages = re.split(r'\n---\n', text)
         
         doc = Document()
         line_number = 0
@@ -219,15 +219,17 @@ class DocumentParser:
                 # 提取内容
                 content = '\n'.join(lines[i:end_i+1])
                 
-                block = DocumentBlock(
-                    type=block_type,
-                    content=content,
-                    line_start=start_line,
-                    line_end=start_line + (end_i - i),
-                    page_num=page_num
-                )
-                
-                doc.add_block(block)
+                # 跳过纯空行的块
+                if content.strip():
+                    block = DocumentBlock(
+                        type=block_type,
+                        content=content,
+                        line_start=start_line,
+                        line_end=start_line + (end_i - i),
+                        page_num=page_num
+                    )
+                    
+                    doc.add_block(block)
                 
                 line_number += (end_i - i + 1)
                 i = end_i + 1
@@ -240,6 +242,14 @@ class DocumentParser:
             return BlockType.TEXT, start
         
         line = lines[start].strip()
+        
+        # 跳过空行 - 不创建空的文本块
+        if not line:
+            # 寻找下一个非空行
+            next_non_empty = start + 1
+            while next_non_empty < len(lines) and not lines[next_non_empty].strip():
+                next_non_empty += 1
+            return BlockType.TEXT, next_non_empty - 1  # 返回空行序列的末尾
         
         # 标题
         if self.patterns['heading'].match(line):
@@ -286,10 +296,25 @@ class DocumentParser:
     
     def _find_table_end(self, lines: List[str], start: int) -> int:
         """找到表格的结束位置"""
-        for i in range(start + 1, len(lines)):
-            if not lines[i].strip() or '|' not in lines[i]:
+        i = start + 1
+        while i < len(lines):
+            line = lines[i].strip()
+            # 空行结束表格
+            if not line:
                 return i - 1
+            # 表格相关的行：包含 | 或者是分隔符
+            if '|' in line or self._is_table_separator(line):
+                i += 1
+                continue
+            # 其他情况结束表格
+            return i - 1
         return len(lines) - 1
+    
+    def _is_table_separator(self, line: str) -> bool:
+        """检测是否是表格分隔符行"""
+        line = line.strip()
+        # 标准 markdown 表格分隔符：|---|---|---|
+        return bool(re.match(r'^\|[\s\-\|]+\|$', line)) and '-' in line
 
 
 # ============================================================================
