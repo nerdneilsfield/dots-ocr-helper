@@ -1,0 +1,17 @@
+source_lang="en"
+target_lang="Chinese中文"
+max_chunk_chars=3000
+translate_tables=false
+translate_links_text=false
+translate_image_alt=false
+keep_node_markers=true
+strict_placeholder_check=true
+retry_failed_nodes=true
+retry_times=3
+parallel_groups=8
+log_level="INFO"
+translator_type="ollama"
+
+[translator_config]
+host="http://localhost:11434"
+model="gpt-oss:20b"

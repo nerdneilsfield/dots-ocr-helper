@@ -1776,7 +1776,7 @@ def fix_complex_titles(markdown_content: str):
                 new_line = f"{new_hashes} {section_prefix}{roman_num}. {title}"
                 new_lines.append(new_line)
                 modified = True
-                print(f"Roman: '{line}' -> '{new_line}'")
+                logging.debug(f"Roman: '{line}' -> '{new_line}'")
         
         if not modified:
             # 处理数字编号（可能是多级）
@@ -1795,7 +1795,7 @@ def fix_complex_titles(markdown_content: str):
                 new_line = f"{new_hashes} {number}. {title}"
                 new_lines.append(new_line)
                 modified = True
-                print(f"Number: '{line}' -> '{new_line}'")
+                logging.debug(f"Number: '{line}' -> '{new_line}'")
         
         if not modified:
             # 处理大写字母编号
@@ -1814,7 +1814,7 @@ def fix_complex_titles(markdown_content: str):
                 new_line = f"{new_hashes} {letter}. {title}"
                 new_lines.append(new_line)
                 modified = True
-                print(f"Letter: '{line}' -> '{new_line}'")
+                logging.debug(f"Letter: '{line}' -> '{new_line}'")
         
         if not modified:
             # 处理小写字母编号
@@ -1833,7 +1833,7 @@ def fix_complex_titles(markdown_content: str):
                 new_line = f"{new_hashes} {letter}. {title}"
                 new_lines.append(new_line)
                 modified = True
-                print(f"Lower letter: '{line}' -> '{new_line}'")
+                logging.debug(f"Lower letter: '{line}' -> '{new_line}'")
         
         if not modified:
             new_lines.append(line)
@@ -2064,7 +2064,7 @@ def fix_titles(markdown_content: str):
                 new_line = f"{hashes} {t.number}. {t.title}"
             
             new_lines.append(new_line)
-            print(f"Fixed: '{line}' -> '{new_line}'")
+            logging.debug(f"Fixed: '{line}' -> '{new_line}'")
         else:
             new_lines.append(line)
     

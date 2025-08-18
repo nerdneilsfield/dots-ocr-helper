@@ -17,6 +17,7 @@ import yaml
 from pathlib import Path
 from tokenize import PlainToken
 from typing import Dict, List, Any, Tuple, Optional
+import difflib
 
 try:
     import coloredlogs
@@ -289,12 +290,12 @@ class OllamaTranslator(BaseTranslator):
             self.retry_times = configs.get("retry_times", 3)
             self.timeout = configs.get("timeout", 7200)
         except Exception as e:
-            print(f"Error: {e}")
+            logging.error(f"Error: {e}")
             raise ValueError("ollama host or model not found")
 
         self.client = ollama.Client(host=self.host)
 
-        print(f"connected to ollama with host {self.host} and model {self.model}")
+        logging.info(f"connected to ollama with host {self.host} and model {self.model}")
 
     def translate(
         self, text: str, source_lang: str, target_lang: str, timeout: int = None
@@ -326,7 +327,7 @@ class OllamaTranslator(BaseTranslator):
             try:
                 return self.translate(text, source_lang, target_lang)
             except Exception as e:
-                print(
+                logging.warning(
                     f"ollama translate failed {retry_times + 1} / {self.retry_times} , reason: {e}"
                 )
                 retry_times += 1
@@ -703,13 +704,35 @@ class MarkdownProtector:
 
 
 class MarkdownTranslator:
-
-    def __init__(self, cfg: TranslateConfig, translator_configs: dict = {}) -> None:
+    def __init__(self, cfg: "TranslateConfig", translator_configs: dict = {}) -> None:
         self.cfg = cfg
         self.protector = MarkdownProtector()
         self.translator = self._create_translator(translator_configs)
 
-    def _create_translator(self, translator_configs: dict = {}) -> BaseTranslator:
+        # 预编译：类内复用的正则
+        self._rx_preserve = re.compile(
+            r"@@PRESERVE_(\d+)@@[\s\S]*?@@/PRESERVE_\1@@", re.DOTALL
+        )
+        self._rx_placeholder = re.compile(r"__PH_[A-Z0-9_]+__")
+        self._rx_latex_dbl = re.compile(r"\$\$[\s\S]*?\$\$", re.DOTALL)
+        self._rx_latex_sgl = re.compile(r"\$[^$]*?\$")
+        self._rx_latex_pi = re.compile(r"\\\((?:.|\n)*?\\\)", re.DOTALL)
+        self._rx_latex_br = re.compile(r"\\\[(?:.|\n)*?\\\]", re.DOTALL)
+        self._rx_html_tag = re.compile(r"</?[^>]+>")
+        self._rx_code_fence = re.compile(r"```[\s\S]*?```", re.DOTALL)
+        self._rx_code_inline = re.compile(r"`[^`]*`")
+        self._rx_url = re.compile(r"https?://\S+|www\.\S+")
+        self._rx_letters = re.compile(
+            r"[A-Za-z\u00C0-\u024F\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]"
+        )
+
+        # 组装/拆组时使用的 NODE 提取
+        self._rx_node_unpack = re.compile(
+            r"<NODE_START_(\d{4})>\s*(.*?)\s*</NODE_END_\1>", re.DOTALL
+        )
+
+    # ---------- 构造翻译器 ----------
+    def _create_translator(self, translator_configs: dict = {}) -> "BaseTranslator":
         if self.cfg.translator_type == "echo":
             return EchoTranslator(translator_configs)
         elif self.cfg.translator_type == "ollama":
@@ -717,8 +740,8 @@ class MarkdownTranslator:
         else:
             raise ValueError(f"Unsupported translator type: {self.cfg.translator_type}")
 
-    def _split_to_nodes(self, text: str) -> dict[int, Node]:
-
+    # ---------- 节点切分 ----------
+    def _split_to_nodes(self, text: str) -> Dict[int, "Node"]:
         lines = text.splitlines(keepends=False)
 
         blocks: List[str] = []
@@ -750,14 +773,13 @@ class MarkdownTranslator:
         flush_block()
 
         # 二次切分：过长的块按句子边界拆
-        nodes: List[Node] = []
+        nodes: List["Node"] = []
         blk_id = 0
         for blk in blocks:
             if len(blk) <= self.cfg.max_chunk_chars:
                 nodes.append(Node(nid=blk_id, origin_text=blk, translated_text=""))
                 blk_id += 1
             else:
-                # 尝试按句号/标点切
                 parts = re.split(r"(?<=[。！？!?\.])\s+", blk)
                 buf = ""
                 for p in parts:
@@ -775,37 +797,127 @@ class MarkdownTranslator:
                     blk_id += 1
 
         nodes = [node for node in nodes if len(node.origin_text) > 0]
-
         nodes_dict = {i: nodes[i] for i in range(len(nodes))}
         return nodes_dict
 
-    def __group_nodes(self, nodes: dict[int, Node]) -> List[str]:
+    # ---------- 内部：文本清洗/判断 ----------
+    def _strip_untranslatables(self, s: str) -> str:
+        s = self._rx_preserve.sub("", s)
+        s = self._rx_placeholder.sub("", s)
+        s = self._rx_latex_dbl.sub("", s)
+        s = self._rx_latex_sgl.sub("", s)
+        s = self._rx_latex_pi.sub("", s)
+        s = self._rx_latex_br.sub("", s)
+        s = self._rx_code_fence.sub("", s)
+        s = self._rx_code_inline.sub("", s)
+        s = self._rx_html_tag.sub("", s)
+        s = self._rx_url.sub("", s)
+        s = re.sub(r"[\s\W_]+", "", s, flags=re.UNICODE)
+        return s
 
+    def _is_placeholder_only(self, s: str) -> bool:
+        """去掉不可译块后，不再含可读文字则视为“无需翻译”（直接透传）"""
+        core = self._strip_untranslatables(s)
+        return not bool(self._rx_letters.search(core))
+
+    def _placeholders_multiset(self, s: str) -> Dict[str, int]:
+        d: Dict[str, int] = {}
+        for m in self._rx_placeholder.finditer(s):
+            tok = m.group(0)
+            d[tok] = d.get(tok, 0) + 1
+        return d
+
+    def _normalize_for_compare(self, s: str) -> str:
+        s = self._rx_html_tag.sub(" ", s)
+        s = self._rx_code_fence.sub(" ", s)
+        s = self._rx_code_inline.sub(" ", s)
+        s = self._rx_latex_dbl.sub(" ", s)
+        s = self._rx_latex_sgl.sub(" ", s)
+        s = self._rx_latex_pi.sub(" ", s)
+        s = self._rx_latex_br.sub(" ", s)
+        s = self._rx_url.sub(" ", s)
+        s = s.lower()
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _contains_target_script(self, s: str, target_lang: str) -> bool:
+        tl = (target_lang or "").lower()
+        if tl.startswith(("zh", "chinese", "cn")):
+            return bool(re.search(r"[\u4E00-\u9FFF]", s))
+        if tl.startswith(("en", "english")):
+            return bool(re.search(r"[A-Za-z]", s))
+        # 其他语言可扩展；默认放行避免误杀
+        return True
+
+    def _is_translation_success(
+        self, orig: str, trans: str, source_lang: str, target_lang: str
+    ) -> bool:
+        # 1) 占位符形状必须一致
+        if self._placeholders_multiset(orig) != self._placeholders_multiset(trans):
+            return False
+        # 2) 原文本就是“无需翻译” → 只要输出非空即成功
+        if self._is_placeholder_only(orig):
+            return bool(trans and trans.strip())
+        # 3) 输出必须非空
+        if not trans or not trans.strip():
+            return False
+        # 4) 目标语言脚本（对较长文本启用）
+        if max(len(orig), len(trans)) >= 8 and not self._contains_target_script(
+            trans, target_lang
+        ):
+            # 仍可被相似度放行
+            pass
+        # 5) 相似度阈值（difflib 代替编辑距离，更稳）
+        a = self._normalize_for_compare(orig)
+        b = self._normalize_for_compare(trans)
+        core = self._strip_untranslatables(orig)
+        if not bool(self._rx_letters.search(core)):
+            return True
+        ratio = difflib.SequenceMatcher(None, a, b).ratio()
+        return ratio < 0.92 or self._contains_target_script(trans, target_lang)
+
+    # ---------- 分组 ----------
+    def __group_nodes(
+        self,
+        nodes: Dict[int, 'Node'],
+        only_ids: Optional[List[int]] = None,
+        max_chunk_chars: Optional[int] = None,
+        include_translated: bool = False,   # NEW: 重试时设 True
+    ) -> List[str]:
         groups: List[str] = []
-
         cur_group = ""
-        for id in nodes.keys():
-            id_str = f"{id:04d}"
-            node_str = f"<NODE_START_{id_str}>\n{nodes[id].origin_text}\n</NODE_END_{id_str}>\n\n"
-            if len(cur_group) + len(node_str) > self.cfg.max_chunk_chars:
-                groups.append(cur_group)
-                cur_group = ""
+        limit = max_chunk_chars or self.cfg.max_chunk_chars
+
+        ids = sorted((only_ids if only_ids is not None else nodes.keys()))
+        emitted = 0  # 调试统计
+        for nid in ids:
+            node = nodes[nid]
+            if (not include_translated) and node.translated_text:
+                # 首轮：已译的（含占位符直过）跳过
+                continue
+            id_str = f"{nid:04d}"
+            node_str = f"<NODE_START_{id_str}>\n{node.origin_text}\n</NODE_END_{id_str}>\n\n"
+            if len(cur_group) + len(node_str) > limit:
+                if cur_group:
+                    groups.append(cur_group)
+                    cur_group = ""
             cur_group += node_str
+            emitted += 1
         if cur_group:
             groups.append(cur_group)
 
+        logging.debug(f"[group] packed {emitted} nodes into {len(groups)} group(s), include_translated={include_translated}")
         return groups
 
+    # ---------- 并发翻译 ----------
     def __translate_groups(self, groups: List[str]) -> List[str]:
-        # 读取并发度，非法值/None 兜底为 1
         max_workers = int(getattr(self.cfg, "parallel_groups", 1) or 1)
         max_workers = max(1, max_workers)
 
-        # 串行退化路径（便于 debug 或限流）
         if max_workers == 1 or len(groups) <= 1:
             translated_groups: List[str] = []
             for i, group in enumerate(groups):
-                print(
+                logging.info(
                     f"translate.... group {i + 1}/{len(groups)} length is {len(group)}"
                 )
                 start_time = time.perf_counter()
@@ -813,13 +925,12 @@ class MarkdownTranslator:
                     group, self.cfg.source_lang, self.cfg.target_lang
                 )
                 cost_ms = (time.perf_counter() - start_time) * 1000.0
-                print(
+                logging.info(
                     f"translated group {i + 1}/{len(groups)} output length is {len(out)} time cost: {cost_ms:.3f}ms"
                 )
                 translated_groups.append(out)
             return translated_groups
 
-        # 并发路径：线程池（I/O 场景优于进程池；保持保序输出）
         def worker(idx: int, group: str):
             start = time.perf_counter()
             out = self.translator.translate_with_retry(
@@ -829,11 +940,10 @@ class MarkdownTranslator:
             return idx, out, cost_ms
 
         n = len(groups)
-        results: List[str] = [None] * n  # 预留，按 idx 回填，保证保序
-        print(f"[parallel] launching {n} tasks with max_workers={max_workers}")
+        results: List[Optional[str]] = [None] * n
+        logging.info(f"[parallel] launching {n} tasks with max_workers={max_workers}")
 
-        # 可选：防止一次性提交过多任务（极大 n 时），分批提交
-        batch = max_workers * 4  # 提交窗口，可按需调
+        batch = max_workers * 4
         with ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="translate"
         ) as ex:
@@ -841,122 +951,153 @@ class MarkdownTranslator:
                 end_i = min(start_i + batch, n)
                 futs = [ex.submit(worker, i, groups[i]) for i in range(start_i, end_i)]
                 for fut in as_completed(futs):
-                    idx, out, cost_ms = (
-                        fut.result()
-                    )  # 若 translate_with_retry 已含重试/429处理，这里可直接取
-                    print(
+                    idx, out, cost_ms = fut.result()
+                    logging.info(
                         f"translated group {idx + 1}/{n} output length is {len(out)} time cost: {cost_ms:.3f}ms"
                     )
                     results[idx] = out
 
-        # 兜底校验
         missing = [i for i, v in enumerate(results) if v is None]
         if missing:
             raise RuntimeError(f"Missing translated results for indices: {missing}")
+        return [v for v in results if v is not None]
 
-        return results
-
+    # ---------- 反分组 ----------
     def _ungroup_nodes(
-        self, group_text: str, origin_nodes: dict[int, Node]
-    ) -> dict[int, Node]:
-
-        nodes: dict[int, Node] = {}
-
-        # print(group_text)
-
-        pat = re.compile(r"<NODE_START_(\d{4})>\s*(.*?)\s*</NODE_END_\1>", re.DOTALL)
-
-        for m in pat.finditer(group_text):
+        self, group_text: str, origin_nodes: Dict[int, "Node"]
+    ) -> Dict[int, "Node"]:
+        nodes: Dict[int, "Node"] = {}
+        for m in self._rx_node_unpack.finditer(group_text):
             node_id = int(m.group(1))
-            # print(f"find node_id {node_id}, str: {m.group(2)}")
             try:
                 node_text = origin_nodes[node_id].origin_text
                 nodes[node_id] = Node(
                     nid=node_id, origin_text=node_text, translated_text=m.group(2)
                 )
             except Exception as e:
-                print(f"Error: {node_id} not exists in origin_nodes, {e}")
-
+                logging.error(f"Error: {node_id} not exists in origin_nodes, {e}")
         return nodes
 
     def _ungroup_groups(
-        self, groups: List[str], origin_nodes: dict[int, Node]
-    ) -> dict[int, Node]:
-        nodes: dict[int, Node] = {}
-
+        self,
+        groups: List[str],
+        origin_nodes: Dict[int, 'Node'],
+        fill_missing: bool = True,   # NEW
+    ) -> Dict[int, 'Node']:
+        nodes: Dict[int, 'Node'] = {}
         for gid in range(len(groups)):
             ungrouped_nodes = self._ungroup_nodes(groups[gid], origin_nodes)
-            # print(f"group {gid} has {len(ungrouped_nodes)} nodes")
             nodes.update(ungrouped_nodes)
 
-        print(f"ungroup start, has {len(nodes)} nodes")
-
-        for id in origin_nodes.keys():
-            if id not in nodes.keys():
-                print(f"find missing {id} adding....")
-                nodes[id] = origin_nodes[id]
-
+        logging.debug(f"ungroup start, has {len(nodes)} nodes (fill_missing={fill_missing})")
+        if fill_missing:
+            for nid in origin_nodes.keys():
+                if nid not in nodes.keys():
+                    # 降低噪声：只在必要时打印
+                    # print(f"find missing {nid} adding....")
+                    nodes[nid] = origin_nodes[nid]
         return nodes
 
-    def _collect_failed_nodes(self, nodes: dict[int, Node]) -> dict[int, Node]:
-        failed_nodes: dict[int, Node] = {}
-        for id in nodes.keys():
-            if nodes[id].translated_text == "":
-                # print(f"failed node {id} length is {len(nodes[id].translated_text)}")
-                failed_nodes[id] = nodes[id]
+    # ---------- 失败收集 ----------
+    def _collect_failed_nodes(self, nodes: Dict[int, 'Node']) -> Dict[int, 'Node']:
+        failed_nodes: Dict[int, 'Node'] = {}
+        for nid, node in nodes.items():
+            ok = self._is_translation_success(
+                node.origin_text, node.translated_text, self.cfg.source_lang, self.cfg.target_lang
+            ) if node.translated_text else False
+            if not ok:
+                failed_nodes[nid] = node
         return failed_nodes
 
-    def merge_nodes(self, nodes: dict[int, Node]) -> str:
+    # ---------- 合并 ----------
+    def merge_nodes(self, nodes: Dict[int, "Node"]) -> str:
         text = ""
-        # sort nodes by id
         sorted_nodes = sorted(nodes.items(), key=lambda x: x[0])
-        for id, node in sorted_nodes:
+        for nid, node in sorted_nodes:
             text += f"\n\n{node.translated_text}\n\n"
         return text
 
+    # ---------- 主流程 ----------
     def translate(
         self, text: str
-    ) -> tuple[str, str, PlaceHolderStore, dict[int, Node]]:
-
+    ) -> Tuple[str, str, "PlaceHolderStore", Dict[int, "Node"]]:
         store = PlaceHolderStore()
 
         protected_text = self.protector.protect(text, self.cfg, store)
-
         nodes = self._split_to_nodes(protected_text)
+        logging.info(f"Has {len(nodes)} nodes")
 
-        print(f"Has {len(nodes)} nodes")
+        # 0) 直接透传“无需翻译”的节点（占位符/保护块/代码/LaTeX-only 等）
+        skip_cnt = 0
+        for nid, node in nodes.items():
+            if self._is_placeholder_only(node.origin_text):
+                node.translated_text = node.origin_text
+                skip_cnt += 1
+        if skip_cnt:
+            logging.debug(f"skip {skip_cnt} placeholder-only nodes")
 
+        # 1) 首轮分组与翻译
         groups = self.__group_nodes(nodes)
-
-        print(f"Has {len(groups)} groups")
-
-        groups = groups
-
-        # for gid in range(len(groups)):
-        #     print(f"group {gid} length is {len(groups[gid])}")
+        logging.info(f"Has {len(groups)} groups")
 
         translated_groups = self.__translate_groups(groups)
-
         translated_nodes = self._ungroup_groups(translated_groups, nodes)
+        logging.info(f"Has {len(translated_nodes)} translated nodes")
 
-        print(f"Has {len(translated_nodes)} translated nodes")
-
+        # 2) 失败收集
         failed_nodes = self._collect_failed_nodes(translated_nodes)
+        logging.info(f"Has {len(failed_nodes)} failed nodes after first pass")
 
-        print(f"Has {len(failed_nodes)} failed nodes")
+        # 3) 重试回路（仅失败子集）
+        if getattr(self.cfg, "retry_failed_nodes", True) and failed_nodes:
+            max_retry = int(getattr(self.cfg, "retry_times", 3) or 0)
+            retry_group_limit = int(getattr(self.cfg, "retry_group_max_chars",
+                                            max(1024, self.cfg.max_chunk_chars // 2)))
+            attempt = 1
+            while failed_nodes and attempt <= max_retry:
+                retry_ids = sorted(failed_nodes.keys())
+                logging.info(f"[retry] attempt {attempt}/{max_retry} on {len(retry_ids)} nodes...")
 
-        # for id in failed_nodes.keys():
-        #     print(
-        #         f"failed node {id} length is {len(failed_nodes[id].origin_text)}, origin text: {nodes[id].origin_text}"
-        #     )
+                # 方式 A（推荐）：不清空旧译文，直接强制 include_translated=True
+                retry_groups = self.__group_nodes(
+                    failed_nodes,
+                    only_ids=retry_ids,
+                    max_chunk_chars=retry_group_limit,
+                    include_translated=True,                 # 关键！
+                )
 
+                # 若你更喜欢“清空后再组”（方式 B），可用以下替代：
+                # for nid in retry_ids:
+                #     failed_nodes[nid].translated_text = ""
+                # retry_groups = self.__group_nodes(failed_nodes, only_ids=retry_ids,
+                #                                   max_chunk_chars=retry_group_limit)
+
+                if not retry_groups:
+                    logging.info("[retry] no groups formed, break.")
+                    break
+
+                retry_groups_out = self.__translate_groups(retry_groups)
+
+                # 只解包重试子集，不做 fill_missing，避免“find missing ...”刷屏
+                retr_nodes = self._ungroup_groups(retry_groups_out, failed_nodes, fill_missing=False)
+                # 写回总表
+                for nid, node in retr_nodes.items():
+                    translated_nodes[nid] = node
+
+                failed_nodes = self._collect_failed_nodes(translated_nodes)
+                logging.info(f"[retry] remaining failed nodes: {len(failed_nodes)}")
+                attempt += 1
+        # 4) 最终兜底：仍失败 → 原文透回（按你的要求）
+        if failed_nodes:
+            for nid in failed_nodes.keys():
+                translated_nodes[nid].translated_text = translated_nodes[
+                    nid
+                ].origin_text
+
+        # 5) 合并/反保护/整理空白
         translated_text = self.merge_nodes(translated_nodes)
-
         translated_text = self.protector.unprotect(translated_text, store)
-
         translated_text = remove_unnecessary_whitespaces(translated_text)
-
-        # print(translated_text)
 
         return translated_text, protected_text, store, translated_nodes
 
@@ -1028,7 +1169,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if not os.path.exists(args.input_file):
-        print(f"Error: input file {args.input_file} does not exist")
+        logging.error(f"Error: input file {args.input_file} does not exist")
         exit(1)
 
     if args.config:
@@ -1036,6 +1177,17 @@ if __name__ == "__main__":
     else:
         cfg = create_default_cfg()
         translator_cfg = {}
+
+    # 根据配置设置日志级别
+    try:
+        _lvl = getattr(logging, str(getattr(cfg, "log_level", "INFO")).upper(), logging.INFO)
+        root_logger = logging.getLogger()
+        if not root_logger.handlers:
+            logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=_lvl)
+        else:
+            root_logger.setLevel(_lvl)
+    except Exception:
+        logging.getLogger().setLevel(logging.INFO)
 
     output_dir = os.path.dirname(os.path.abspath(args.output_file))
     os.makedirs(output_dir, exist_ok=True)

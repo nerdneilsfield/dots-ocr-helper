@@ -1,0 +1,148 @@
+$-- Minimal Pandoc template: JS-only TOC drawer + theme switch
+<!doctype html>
+<html$if(lang)$ lang="$lang$"$endif$>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
+  $if(title)$<title>$title$</title>$else$<title>Document</title>$endif$
+  $if(author-meta)$<meta name="author" content="$author-meta$"/>$endif$
+  $if(date-meta)$<meta name="date" content="$date-meta$"/>$endif$
+  <meta name="generator" content="pandoc"/>
+
+  $for(css)$<link rel="stylesheet" href="$css$"/>$endfor$
+  $if(highlighting-css)$<style>$highlighting-css$</style>$endif$
+  $for(header-includes)$ $header-includes$ $endfor$
+
+  <!-- 仅负责主题覆盖（变量）；其余样式放 style.css -->
+  <style>
+    html.force-dark, body.force-dark{
+      --bg:#0f1115; --fg:#e7e7e7; --fg-subtle:#cfcfcf; --muted:#9aa0a6; --border:#2a2f3a;
+      --brand:#ff6b66; --brand-600:#ff4b44; --brand-100:#2a1a1a;
+      --code-bg:#161a22; --code-fg:#e7e7e7; --table-zebra:#151922; --quote-bar:#ff6b66;
+    }
+    html.force-light, body.force-light{
+      --bg:#ffffff; --fg:#1f1f1f; --fg-subtle:#444; --muted:#777; --border:#e6e6e6;
+      --brand:#f22f27; --brand-600:#e21f1c; --brand-100:#fff3f0;
+      --code-bg:#f6f8fa; --code-fg:#24292e; --table-zebra:#fafafa; --quote-bar:#f22f27;
+    }
+    /* 两个小按钮的基础外观（避免依赖你旧样式） */
+    .btn-fab{
+      position: fixed; right: 16px; z-index: 1001;
+      appearance:none; border:1px solid var(--border); background:var(--bg); color:var(--fg);
+      border-radius:999px; padding:10px 14px; cursor:pointer; box-shadow:0 6px 18px rgba(0,0,0,.12);
+    }
+    #btn-theme{ bottom: 72px; }
+    #btn-toc{ bottom: 16px; }
+  </style>
+
+  <!-- 预应用主题，防闪烁 -->
+  <script>
+    (function(){
+      try{
+        var pref = localStorage.getItem('qiqi.theme') || 'auto';
+        var d = document.documentElement;
+        if(pref==='dark') d.classList.add('force-dark');
+        if(pref==='light') d.classList.add('force-light');
+      }catch(e){}
+    })();
+  </script>
+</head>
+
+<body>
+$for(include-before)$ $include-before$ $endfor$
+
+<header class="page-header">
+  $if(title)$<h1 class="title">$title$</h1>$endif$
+  $if(subtitle)$<p class="subtitle">$subtitle$</p>$endif$
+  $if(author)$<p class="author">$for(author)$$author$$sep$ · $endfor$</p>$endif$
+  $if(date)$<p class="date">$date$</p>$endif$
+</header>
+
+<!-- TOC 抽屉（只有一个） -->
+$if(toc)$
+  <aside id="toc-drawer" aria-label="Table of contents" aria-hidden="true">
+    <div class="toc-header">
+      <strong>$if(toc-title)$$toc-title$$else$Table of Contents$endif$</strong>
+      <button class="toc-close" type="button" aria-label="关闭">×</button>
+    </div>
+    $table-of-contents$
+  </aside>
+  <div id="toc-backdrop" hidden></div>
+  <button id="btn-toc" class="btn-fab" type="button" aria-controls="toc-drawer" aria-expanded="false">☰ 目录</button>
+$endif$
+
+<!-- 主题开关（一个） -->
+<button id="btn-theme" class="btn-fab" type="button" aria-live="polite">🌓 自动</button>
+
+<main id="write" class="content">
+  $body$
+</main>
+
+<footer class="page-footer">$if(footer)$ $footer$ $endif$</footer>
+
+$for(include-after)$ $include-after$ $endfor$
+$if(math)$ $math$ $endif$
+
+<!-- 行为脚本：TOC 抽屉 + 主题 -->
+<script>
+(function(){ // TOC
+  var btn = document.getElementById('btn-toc');
+  var drawer = document.getElementById('toc-drawer');
+  var closeBtn = drawer ? drawer.querySelector('.toc-close') : null;
+  var backdrop = document.getElementById('toc-backdrop');
+  if(!drawer || !btn) return;
+
+  function open(){
+    document.body.classList.add('toc-open');
+    btn.setAttribute('aria-expanded','true');
+    drawer.setAttribute('aria-hidden','false');
+    backdrop.hidden = false;
+  }
+  function close(){
+    document.body.classList.remove('toc-open');
+    btn.setAttribute('aria-expanded','false');
+    drawer.setAttribute('aria-hidden','true');
+    backdrop.hidden = true;
+  }
+  function toggle(){ (document.body.classList.contains('toc-open') ? close : open)(); }
+
+  btn.addEventListener('click', toggle);
+  closeBtn && closeBtn.addEventListener('click', close);
+  backdrop && backdrop.addEventListener('click', close);
+  document.addEventListener('keydown', function(e){
+    if(e.key==='Escape') close();
+    if(e.key && e.key.toLowerCase()==='t') toggle();
+  });
+  // 移动端：点目录项后收起
+  var toc = document.getElementById('TOC');
+  if(toc){
+    toc.addEventListener('click', function(e){
+      if(e.target.closest('a') && window.matchMedia('(max-width:1100px)').matches){ setTimeout(close, 80); }
+    });
+  }
+})();
+
+(function(){ // Theme
+  var KEY='qiqi.theme', mql=window.matchMedia('(prefers-color-scheme: dark)');
+  var btn=document.getElementById('btn-theme');
+  function get(){ try{return localStorage.getItem(KEY)||'auto';}catch(e){return 'auto';} }
+  function set(v){ try{localStorage.setItem(KEY,v);}catch(e){} }
+  function apply(v){
+    var d=document.documentElement; d.classList.remove('force-dark','force-light');
+    if(v==='dark') d.classList.add('force-dark');
+    if(v==='light') d.classList.add('force-light');
+    if(btn){ btn.textContent = v==='auto' ? (mql.matches?'🌓 自动·深色':'🌓 自动·浅色') : (v==='dark'?'🌙 深色':'☀️ 浅色'); }
+  }
+  function cycle(){ var v=get(); v = (v==='auto')?'dark':(v==='dark'?'light':'auto'); set(v); apply(v); }
+  apply(get());
+  mql.addEventListener && mql.addEventListener('change', function(){ if(get()==='auto') apply('auto'); });
+  btn && btn.addEventListener('click', cycle);
+  document.addEventListener('keydown', function(e){
+    if(e.target && /input|textarea|select/i.test(e.target.tagName)) return;
+    if(e.key && e.key.toLowerCase()==='d') cycle();
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,169 @@
+/* qiqi-min.css — Minimal Markdown/Pandoc CSS
+   - CN-first fonts
+   - Fixed content width
+   - Code + Pandoc sourceCode compatible
+   - JS-driven TOC drawer (#toc-drawer) + two floating buttons
+   - Auto dark/light via prefers-color-scheme
+*/
+
+/* ========== Variables ========== */
+:root{
+    --font-sans: "PingFang SC","SF Pro SC","SF Pro Text","Hiragino Sans GB",
+                 "Microsoft YaHei UI","Microsoft YaHei",
+                 "Noto Sans CJK SC","Noto Sans SC","Source Han Sans SC",
+                 "WenQuanYi Micro Hei","MiSans",
+                 "Inter","Source Sans 3","Helvetica Neue",Arial,ui-sans-serif,sans-serif;
+    --font-mono: "Fira Code VF","Fira Code","JetBrains Mono","Sarasa Mono SC","等距更纱黑体 SC",
+                 "Noto Sans Mono CJK SC","Cascadia Code","SFMono-Regular",
+                 Consolas,Menlo,Monaco,ui-monospace,monospace;
+  
+    /* Light */
+    --bg:#ffffff; --fg:#1f1f1f; --muted:#777; --border:#e6e6e6;
+    --brand:#f22f27; --brand-600:#e21f1c; --brand-100:#fff3f0;
+    --code-bg:#f6f8fa; --code-fg:#24292e; --table-zebra:#fafafa;
+  
+    /* Layout */
+    --content-w: 860px;       /* 正文最大宽度 */
+    --toc-drawer-w: 320px;    /* TOC 抽屉宽度 */
+    --r: 8px;                 /* 圆角 */
+    --fs: 14px;               /* 基准字号 */
+    --lh: 1.8;                /* 行高 */
+  }
+  
+  /* Dark (auto) */
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0f1115; --fg:#e7e7e7; --muted:#9aa0a6; --border:#2a2f3a;
+      --brand:#ff6b66; --brand-600:#ff4b44; --brand-100:#2a1a1a;
+      --code-bg:#161a22; --code-fg:#e7e7e7; --table-zebra:#151922;
+    }
+  }
+  
+  /* ========== Base ========== */
+  html{ font-size: var(--fs); }
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font-family: var(--font-sans); line-height: var(--lh);
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  }
+  
+  /* 容器：Pandoc 模板里的 <main id="write" class="content"> */
+  #write{ max-width: var(--content-w); margin: 0 auto; padding: 20px 24px 120px; }
+  /* 兼容 GitHub 风格容器 */
+  .markdown-body{ max-width: var(--content-w); margin: 0 auto; padding: 20px 24px 120px; }
+  
+  a{ color: var(--brand); text-decoration: none; }
+  #write a, .markdown-body a{ border-bottom: 1px solid var(--brand); }
+  #write a:hover, .markdown-body a:hover{ color: var(--brand-600); border-bottom-width: 2px; }
+  
+  /* 标题 */
+  h1,h2,h3,h4,h5,h6{ margin: 1.4em 0 .8em; font-weight: 700; line-height: 1.35; }
+  h1{ font-size: 2rem; text-align: center; margin: 2.2em 0 1.2em; }
+  h1::after{ content:""; display:block; width:100px; margin:.3em auto 0; border-bottom:2px dashed var(--brand); }
+  h2{ font-size: 1.6rem; padding-left: 8px; border-left: 6px solid var(--brand); }
+  h3{ font-size: 1.35rem; }
+  h4{ font-size: 1.2rem; }
+  
+  /* 文本块 */
+  p, blockquote, ul, ol, dl, table{ margin: .9em 0; }
+  ul,ol{ padding-left: 1.6em; }
+  #write p, .markdown-body p{ text-align: justify; text-justify: inter-ideograph; }
+  blockquote{ margin: 1.5rem 0; padding: 1rem; color: var(--muted); border-left: 3px solid var(--brand); background: transparent; }
+  hr{ border: 0; border-top: 1px solid var(--border); margin: 2.4rem 0; }
+  
+  /* 表格 */
+  table{ border-collapse: collapse; width: 100%; margin: 1.6rem auto; }
+  thead{ background: var(--table-zebra); }
+  th,td{ border: 1px solid var(--border); padding: .55rem .75rem; text-align: left; vertical-align: top; }
+  tr:nth-child(2n){ background: var(--table-zebra); }
+  
+  /* 代码与 Pandoc 高亮 */
+  code, tt, kbd, samp{
+    font-family: var(--font-mono); font-size: .92rem;
+    color: #b04b3f; background: var(--brand-100);
+    border-radius: 4px; padding: 2px 5px; margin: 0 2px;
+  }
+  pre, pre code{ font-family: var(--font-mono); font-size: .92rem; line-height: 1.55rem; }
+  pre{
+    background: var(--code-bg); color: var(--code-fg);
+    border: 1px solid var(--border); border-radius: var(--r);
+    padding: 1rem 1.2rem; overflow: auto;
+  }
+  pre>code{ background: transparent; color: inherit; padding: 0; }
+  div.sourceCode{ margin: 1.2rem 0; border: 1px solid var(--border); border-radius: var(--r); overflow: auto; }
+  div.sourceCode pre{ background: var(--code-bg); color: var(--code-fg); }
+  pre.numberSource code>span{ display: inline-block; min-width: 100%; }
+  pre.numberSource code>span>a:first-child::before{ color: var(--muted); text-decoration: none; }
+  pre.numberSource{ padding-left: .5rem; }
+  
+  /* 媒体 */
+  img{ max-width: 100%; height: auto; border: 0; border-radius: 4px; }
+  figure{ margin: 1.6rem 0; }
+  figcaption{ color: var(--muted); font-size: .95rem; text-align: center; margin-top: .4rem; }
+  
+  /* ========== TOC Drawer（由 JS 控制开关） ========== */
+  /* 需要模板中存在：
+     <aside id="toc-drawer">…$table-of-contents$…</aside>
+     <div id="toc-backdrop"></div>
+     <button id="btn-toc" class="btn-fab">☰ 目录</button>
+     <button id="btn-theme" class="btn-fab">🌓</button>
+  */
+  #toc-drawer{
+    position: fixed; top: 0; right: 0; height: 100%;
+    width: min(86vw, var(--toc-drawer-w));
+    background: var(--bg); color: var(--fg);
+    border-left: 1px solid var(--border); overflow: auto;
+    transform: translateX(100%); transition: transform .25s ease;
+    z-index: 1000;
+  }
+  body.toc-open #toc-drawer{ transform: translateX(0); }
+  
+  #toc-backdrop{
+    position: fixed; inset: 0; background: rgba(0,0,0,.28);
+    z-index: 999; display: none;
+  }
+  body.toc-open #toc-backdrop{ display: block; }
+  
+  #toc-drawer .toc-header{
+    position: sticky; top: 0; display: flex; align-items: center; justify-content: space-between;
+    padding: 12px; border-bottom: 1px dashed var(--border); background: var(--bg); z-index: 1;
+  }
+  #toc-drawer .toc-close{ border: none; background: none; color: inherit; font-size: 1.2rem; cursor: pointer; }
+  #toc-drawer #TOC{ padding: 12px; margin: 0; }
+  #toc-drawer #TOC ul{ list-style: none; padding-left: 0; margin: 0; }
+  #toc-drawer #TOC li{ margin: .25rem 0; }
+  #toc-drawer #TOC a{ border: none; text-decoration: none; }
+  #toc-drawer #TOC a:hover{ text-decoration: underline; }
+  
+  /* 浮动按钮（右下） */
+  .btn-fab{
+    position: fixed; right: 16px; z-index: 1001;
+    appearance: none; border: 1px solid var(--border);
+    background: var(--bg); color: var(--fg);
+    border-radius: 999px; padding: 10px 14px; cursor: pointer;
+    box-shadow: 0 6px 18px rgba(0,0,0,.12);
+  }
+  #btn-theme{ bottom: 72px; }
+  #btn-toc{ bottom: 16px; }
+  
+  /* ========== Mobile ========== */
+  @media (max-width: 900px){
+    #write{ padding: 16px 16px 96px; }
+    h1{ font-size: 1.7rem; }
+    h2{ font-size: 1.35rem; }
+    h3{ font-size: 1.2rem; }
+    pre, pre code{ font-size: .9rem; line-height: 1.5rem; }
+  
+    table{ display: block; width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    thead, tbody, tr{ width: max-content; min-width: 100%; }
+  }
+  
+  /* ========== Print ========== */
+  @media print{
+    html{ font-size: 13px; }
+    a{ color: inherit; text-decoration: underline; border: 0; }
+    pre, table{ page-break-inside: avoid; }
+    pre{ background: #fff; border: 1px solid #ccc; }
+    #toc-drawer, #toc-backdrop, #btn-toc, #btn-theme{ display: none !important; }
+  }
+  
