@@ -77,6 +77,10 @@ class DocumentBlock:
         if self.type == BlockType.PAGE_BOUNDARY or other.type == BlockType.PAGE_BOUNDARY:
             return False, "页面边界"
         
+        # 元数据块不合并
+        if self.type == BlockType.METADATA or other.type == BlockType.METADATA:
+            return False, "元数据块"
+        
         # 不同类型一般不合并  
         if self.type != other.type:
             return False, f"类型不同: {self.type} vs {other.type}"
@@ -104,11 +108,9 @@ class Document:
         self.blocks.append(block)
     
     def merge_consecutive_blocks(self) -> int:
-        """合并连续的块"""
-        if len(self.blocks) < 2:
-            return 0
-        
-        merged_count = 0
+        """已废弃 - FSM 在 Phase 3 中处理合并"""
+        # 这个功能已经被 Phase 3 的 FSM 取代
+        return 0
         new_blocks = []
         i = 0
         
@@ -151,13 +153,29 @@ class Document:
     
     def to_markdown(self) -> str:
         """转换回Markdown"""
-        lines = []
-        for block in self.blocks:
-            if block.type == BlockType.PAGE_BOUNDARY:
-                continue  # 跳过页面边界标记
-            lines.append(block.content)
+        result_parts = []
+        prev_was_boundary = False
         
-        result = '\n'.join(lines)
+        for i, block in enumerate(self.blocks):
+            if block.type == BlockType.PAGE_BOUNDARY:
+                prev_was_boundary = True
+                continue  # 跳过页面边界标记，但记住它
+            
+            # 如果前一个是页面边界，确保有换行
+            if prev_was_boundary and result_parts:
+                if not result_parts[-1].endswith('\n\n'):
+                    result_parts.append('\n\n')
+            
+            result_parts.append(block.content)
+            prev_was_boundary = False
+            
+            # 添加适当的间距（除了最后一个块）
+            if i < len(self.blocks) - 1:
+                next_block = self.blocks[i + 1]
+                if next_block.type != BlockType.PAGE_BOUNDARY:
+                    result_parts.append('\n\n')  # 块间用双换行
+        
+        result = ''.join(result_parts)
         
         # 清理多余空行
         while '\n\n\n' in result:
@@ -183,15 +201,15 @@ class DocumentParser:
             'table_markdown': re.compile(r'^\|'),
             'reference': re.compile(r'^\[(\d+)\]'),
             'page_boundary': re.compile(r'^---$'),
+            'metadata': re.compile(r'^\*Generated from PDF.*\*$|^\*\d+ pages\*$'),  # 只匹配特定的元数据
         }
     
     def parse(self, text: str) -> Document:
-        """解析文本为文档对象"""
+        """解析文本为文档对象 - 借鉴 py_translate_md 的精确块划分"""
         # 精确分割页面：只有独立成行的 --- 才是页面分隔符
         pages = re.split(r'\n---\n', text)
         
         doc = Document()
-        line_number = 0
         
         for page_num, page_content in enumerate(pages):
             if page_num > 0:
@@ -199,42 +217,367 @@ class DocumentParser:
                 doc.add_block(DocumentBlock(
                     type=BlockType.PAGE_BOUNDARY,
                     content='---',
-                    line_start=line_number,
-                    line_end=line_number,
+                    line_start=0,
+                    line_end=0,
                     page_num=page_num
                 ))
-                line_number += 1
             
-            # 解析页面内容
-            lines = page_content.split('\n')
-            i = 0
-            
-            while i < len(lines):
-                line = lines[i]
-                start_line = line_number
-                
-                # 检测块类型
-                block_type, end_i = self._detect_block_type(lines, i)
-                
-                # 提取内容
-                content = '\n'.join(lines[i:end_i+1])
-                
-                # 跳过纯空行的块
-                if content.strip():
-                    block = DocumentBlock(
-                        type=block_type,
-                        content=content,
-                        line_start=start_line,
-                        line_end=start_line + (end_i - i),
-                        page_num=page_num
-                    )
-                    
-                    doc.add_block(block)
-                
-                line_number += (end_i - i + 1)
-                i = end_i + 1
+            # 使用精确的块划分方法
+            page_blocks = self._partition_by_blocks(page_content, page_num)
+            for block in page_blocks:
+                doc.add_block(block)
         
         return doc
+    
+    def _partition_by_blocks(self, text: str, page_num: int) -> List[DocumentBlock]:
+        """三阶段块划分：1) 基础分割 2) 智能合并 3) 智能分离"""
+        # Phase 1: 基础分割 - 简单规则
+        raw_blocks = self._phase1_basic_split(text, page_num)
+        
+        # Phase 2: 智能拆分 - 分开混合块
+        split_blocks = self._phase2_smart_split(raw_blocks)
+        
+        # Phase 3: 智能合并 - 连接相关块
+        refined_blocks = self._phase3_smart_merge(split_blocks)
+        
+        return refined_blocks
+    
+    def _phase1_basic_split(self, text: str, page_num: int) -> List[DocumentBlock]:
+        """Phase 1: 机械式分割 - 按明确边界分割"""
+        lines = text.splitlines(keepends=True)
+        blocks = []
+        i = 0
+        n = len(lines)
+        
+        while i < n:
+            line = lines[i]
+            
+            # 1) 围栏代码 ``` / ~~~
+            fence = self._line_starts_with_fence(line)
+            if fence:
+                j = i + 1
+                while j < n and not re.match(rf'^\s*{re.escape(fence)}', lines[j]):
+                    j += 1
+                # 包含起止两行
+                if j < n:
+                    content = ''.join(lines[i:j+1]).rstrip('\n')
+                    blocks.append(DocumentBlock(
+                        type=BlockType.CODE_FENCE,
+                        content=content,
+                        line_start=i,
+                        line_end=j,
+                        page_num=page_num
+                    ))
+                    i = j + 1
+                    continue
+                else:
+                    # 未闭合：按剩余全当代码块处理
+                    content = ''.join(lines[i:]).rstrip('\n')
+                    blocks.append(DocumentBlock(
+                        type=BlockType.CODE_FENCE,
+                        content=content,
+                        line_start=i,
+                        line_end=n-1,
+                        page_num=page_num
+                    ))
+                    break
+
+            # 2) 块级数学 $$...$$
+            if self._line_is_block_math_open(line):
+                j = i + 1
+                while j < n and not self._line_is_block_math_close(lines[j]):
+                    j += 1
+                if j < n:
+                    content = ''.join(lines[i:j+1]).rstrip('\n')
+                    blocks.append(DocumentBlock(
+                        type=BlockType.MATH_BLOCK,
+                        content=content,
+                        line_start=i,
+                        line_end=j,
+                        page_num=page_num
+                    ))
+                    i = j + 1
+                    continue
+                else:
+                    content = ''.join(lines[i:]).rstrip('\n')
+                    blocks.append(DocumentBlock(
+                        type=BlockType.MATH_BLOCK,
+                        content=content,
+                        line_start=i,
+                        line_end=n-1,
+                        page_num=page_num
+                    ))
+                    break
+
+            # 3) 表格
+            if (i + 1 < n and 
+                self._looks_like_table_header(line) and 
+                self._looks_like_table_delim(lines[i + 1])):
+                j = i + 2
+                # 吸收后续表行，直到遇到空行或非表格行
+                while (j < n and 
+                       ('|' in lines[j] or self._looks_like_table_delim(lines[j])) and 
+                       not self._is_blank(lines[j])):
+                    j += 1
+                content = ''.join(lines[i:j]).rstrip('\n')
+                blocks.append(DocumentBlock(
+                    type=BlockType.TABLE,
+                    content=content,
+                    line_start=i,
+                    line_end=j-1,
+                    page_num=page_num
+                ))
+                i = j
+                continue
+
+            # 4) 标题
+            if self._looks_like_heading(line):
+                blocks.append(DocumentBlock(
+                    type=BlockType.HEADING,
+                    content=line.rstrip('\n'),
+                    line_start=i,
+                    line_end=i,
+                    page_num=page_num
+                ))
+                i += 1
+                continue
+                
+            # 5) 伪代码块检测 - **Algorithm X** 
+            if self._is_algorithm_header(line):
+                # 扫描完整的算法块
+                j = self._find_algorithm_end(lines, i)
+                content = '\n'.join([lines[k].rstrip('\n') for k in range(i, j+1)])
+                blocks.append(DocumentBlock(
+                    type=BlockType.CODE_FENCE,  # 当作代码块处理，后续包裹
+                    content=content,
+                    line_start=i,
+                    line_end=j,
+                    page_num=page_num,
+                    metadata={'is_algorithm': True}
+                ))
+                i = j + 1
+                continue
+
+            # 6) 元数据行
+            if self.patterns['metadata'].match(line.strip()):
+                blocks.append(DocumentBlock(
+                    type=BlockType.METADATA,
+                    content=line.rstrip('\n'),
+                    line_start=i,
+                    line_end=i,
+                    page_num=page_num
+                ))
+                i += 1
+                continue
+
+            # 7) 空行 - 跳过
+            if self._is_blank(line):
+                i += 1
+                continue
+
+            # 8) 简单统一规则：每行独立处理
+            blocks.append(DocumentBlock(
+                type=BlockType.TEXT,
+                content=lines[i].rstrip('\n'),
+                line_start=i,
+                line_end=i,
+                page_num=page_num
+            ))
+            i += 1
+
+        return blocks
+    
+    def _phase2_smart_split(self, blocks: List[DocumentBlock]) -> List[DocumentBlock]:
+        """Phase 2: 智能拆分 - 拆分混合在一起的内容"""
+        # 暂时禁用算法块拆分，因为它的实现有问题
+        # 算法块应该在后处理阶段处理
+        return blocks
+    
+    def _phase3_smart_merge(self, blocks: List[DocumentBlock]) -> List[DocumentBlock]:
+        """Phase 3: 智能合并 - 使用FSM处理复杂合并"""
+        if not blocks:
+            return blocks
+        
+        # 先过滤掉不需要的元数据块
+        filtered = []
+        for block in blocks:
+            # 跳过 Generated from PDF 等元数据
+            if block.type == BlockType.METADATA:
+                continue
+            filtered.append(block)
+        
+        # 创建 FSM 实例进行智能合并
+        fsm = RepairFSM()
+        
+        # 创建临时文档对象
+        temp_doc = Document()
+        for block in filtered:
+            temp_doc.add_block(block)
+        
+        # 使用 FSM 进行智能修复
+        repaired_doc = fsm.repair_document(temp_doc)
+        
+        return repaired_doc.blocks
+    
+    # 已删除旧的 phase3 合并代码，现在使用 FSM
+    
+    def _split_algorithm_from_text(self, block: DocumentBlock) -> List[DocumentBlock]:
+        """从文本块中分离算法块"""
+        content = block.content
+        
+        # 查找算法开始位置
+        import re
+        alg_match = re.search(r'\*\*Algorithm\s+\d+\*\*', content)
+        if not alg_match:
+            return [block]
+        
+        start_pos = alg_match.start()
+        
+        # 分离前半部分和算法部分
+        before = content[:start_pos].strip()
+        algorithm_part = content[start_pos:].strip()
+        
+        result_blocks = []
+        
+        # 前半部分
+        if before:
+            result_blocks.append(DocumentBlock(
+                type=BlockType.TEXT,
+                content=before,
+                line_start=block.line_start,
+                line_end=block.line_start,
+                page_num=block.page_num
+            ))
+        
+        # 算法部分包裹在代码块中 - 修复：使用正确的 CODE_FENCE 类型
+        result_blocks.append(DocumentBlock(
+            type=BlockType.CODE_FENCE,
+            content=f"```\n{algorithm_part}\n```",
+            line_start=block.line_start,
+            line_end=block.line_end,
+            page_num=block.page_num
+        ))
+        
+        return result_blocks
+    
+    def _should_merge_with_next(self, current: DocumentBlock, next_blocks: List[DocumentBlock]) -> bool:
+        """判断当前块是否应该与后续块合并"""
+        if not next_blocks or next_blocks[0].type != BlockType.TEXT:
+            return False
+        
+        curr_content = current.content
+        next_content = next_blocks[0].content
+        
+        # 标题不应该与其他内容合并（标题通常较长且包含特定关键词）
+        if self._is_title_line(curr_content):
+            return False
+            
+        # 作者信息之间可以合并，但不与其他内容合并
+        if self._is_author_line(curr_content):
+            return self._is_author_line(next_content)
+            
+        # 正常段落合并逻辑
+        return (len(curr_content) > 50 and 
+                len(next_content) < 100 and
+                not self._is_author_line(next_content) and
+                not next_content.startswith('**') and
+                not next_content.startswith('#'))
+    
+    def _can_merge_blocks(self, first: DocumentBlock, second: DocumentBlock) -> bool:
+        """判断两个块是否可以合并"""
+        return (len(second.content) < 100 and
+                not self._is_author_line(second.content) and
+                not second.content.startswith('**') and
+                not second.content.startswith('Fig.'))
+    
+    def _is_author_line(self, content: str) -> bool:
+        """判断是否是作者信息行"""
+        content_lower = content.lower()
+        return ('university' in content_lower or
+                'institute' in content_lower or 
+                'college' in content_lower or
+                'school' in content_lower or
+                ', china' in content_lower or
+                (content.isupper() and ',' in content))  # 大写名字带逗号
+    
+    def _is_title_line(self, content: str) -> bool:
+        """判断是否是标题行"""
+        content_lower = content.lower()
+        # 标题通常包含关键词且较长
+        return (len(content) > 80 and (
+            'framework' in content_lower or
+            'algorithm' in content_lower or
+            'system' in content_lower or
+            'method' in content_lower or
+            'approach' in content_lower or
+            'efficient' in content_lower or
+            'real-time' in content_lower or
+            'registration' in content_lower
+        ))
+    
+    # 辅助方法
+    @staticmethod
+    def _is_blank(line: str) -> bool:
+        return len(line.strip()) == 0
+
+    @staticmethod
+    def _line_starts_with_fence(line: str) -> Optional[str]:
+        m = re.match(r'^\s*(`{3,}|~{3,})', line)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _line_is_block_math_open(line: str) -> bool:
+        return line.strip() == '$$'
+
+    @staticmethod
+    def _line_is_block_math_close(line: str) -> bool:
+        return line.strip() == '$$'
+
+    @staticmethod
+    def _looks_like_table_header(line: str) -> bool:
+        return '|' in line
+
+    @staticmethod
+    def _looks_like_table_delim(line: str) -> bool:
+        return re.match(r'^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$', line) is not None
+
+    @staticmethod
+    def _looks_like_heading(line: str) -> bool:
+        return re.match(r'^\s{0,3}#{1,6}\s+', line) is not None
+    
+    def _is_algorithm_header(self, line: str) -> bool:
+        """检测算法标题行"""
+        return bool(re.match(r'^\s*\*?\*?\s*Algorithm\s+\d+.*', line.strip(), re.IGNORECASE))
+    
+    def _find_algorithm_end(self, lines: List[str], start: int) -> int:
+        """找到算法块的结束位置"""
+        i = start + 1
+        n = len(lines)
+        
+        while i < n:
+            line = lines[i].strip()
+            # 空行继续
+            if not line:
+                i += 1
+                continue
+            # 遇到标题停止
+            if self._looks_like_heading(line):
+                return i - 1
+            # 遇到新算法停止
+            if self._is_algorithm_header(line):
+                return i - 1
+            # 算法内容模式
+            if (line.startswith(('Input:', 'Output:', '**Input:', '**Output:')) or
+                re.match(r'^\d+:', line) or
+                line.startswith('**for**') or line.startswith('**if**') or
+                line.startswith('**end**') or
+                '**' in line):
+                i += 1
+                continue
+            # 其他内容继续算法块
+            i += 1
+            
+        return n - 1
     
     def _detect_block_type(self, lines: List[str], start: int) -> Tuple[BlockType, int]:
         """检测块类型和结束位置"""
@@ -276,6 +619,10 @@ class DocumentParser:
         # 引用
         if self.patterns['reference'].match(line):
             return BlockType.REFERENCE, start
+        
+        # 元数据
+        if self.patterns['metadata'].match(line):
+            return BlockType.METADATA, start
         
         # 默认是文本
         return BlockType.TEXT, start
@@ -441,7 +788,7 @@ class PseudocodeProcessor:
     
     def __init__(self):
         self.alg_header_pattern = re.compile(
-            r'^\s*(\*\*)?\s*(Algorithm|算法)\s+([A-Za-z0-9.-]+)?\s*(\*\*)?\s*(.*)$',
+            r'^\s*\*?\*?\s*(Algorithm|算法)\s+([A-Za-z0-9.-]+)?\*?\*?\s*(.*)$',
             re.IGNORECASE
         )
     
@@ -484,10 +831,19 @@ class PseudocodeProcessor:
                 # 处理标题行
                 m = self.alg_header_pattern.match(header_line)
                 if m:
-                    alg_no = (m.group(3) or "").strip()
-                    rest = (m.group(5) or "").strip()
-                    title = f"Algorithm {alg_no}: {rest}".strip() if alg_no or rest else "Algorithm"
-                    out.append(f"// {self._clean_inline(title)}")
+                    alg_no = (m.group(2) or "").strip()
+                    rest = (m.group(3) or "").strip()
+                    # 清理 rest 中的格式标记
+                    rest = self._clean_inline(rest)
+                    if alg_no and rest:
+                        title = f"Algorithm {alg_no}: {rest}"
+                    elif alg_no:
+                        title = f"Algorithm {alg_no}"
+                    elif rest:
+                        title = f"Algorithm: {rest}"
+                    else:
+                        title = "Algorithm"
+                    out.append(f"// {title}")
                 
                 for raw in block[1:]:
                     s = raw.strip()
@@ -509,8 +865,13 @@ class PseudocodeProcessor:
         s = line.strip()
         if s == "" or s == "***":
             return True
+        # 数字步骤：1: Initialize、2. Process 等
         if re.match(r'^\s*\d+\s*[:.)]\ ', s):
             return True
+        # 输入输出：Input:、Output: 等
+        if re.match(r'^\s*(Input|Output|Require|Ensure):\s*', s, re.I):
+            return True
+        # 关键字：function、for、while 等
         if re.match(r'^\s*(function|procedure|for|while|if|else|repeat|return|end)\b', s, re.I):
             return True
         return False
@@ -520,7 +881,10 @@ class PseudocodeProcessor:
         text = re.sub(r'<\s*sub\s*>\s*(.*?)\s*<\s*/\s*sub\s*>', lambda m: '_' + re.sub(r'\*', '', m.group(1)), text, flags=re.I)
         text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
         text = re.sub(r'\*([^\*]+)\*', r'\1', text)
-        return text
+        # 清理未闭合的格式标记
+        text = re.sub(r'\*+$', '', text)  # 去除末尾的 *
+        text = re.sub(r'^\*+', '', text)  # 去除开头的 *
+        return text.strip()
 
 
 # ============================================================================
@@ -779,31 +1143,82 @@ class MarkdownFixer:
         self.ref_processor = ReferenceProcessor()
         self.title_processor = TitleProcessor()
         self.pseudo_processor = PseudocodeProcessor()
-        self.repair_fsm = RepairFSM()  # 添加FSM处理复杂场景
+        # FSM 现在集成在 Phase 3 中，不需要单独初始化
     
     def fix(self, text: str) -> str:
-        """主修复方法 - 四步流水线"""
-        # Step 1: 解析
+        """主修复方法 - 三阶段流水线"""
+        # Step 1: 解析 - 三阶段处理已经包含FSM
         doc = self.parser.parse(text)
-        
-        # Step 2: 简单合并
-        merged_count = doc.merge_consecutive_blocks()
-        
-        # Step 3: FSM复杂修复 ⭐新增⭐
-        doc = self.repair_fsm.repair_document(doc)
         
         # Step 4: 输出
         result = doc.to_markdown()
         
-        # 后处理
+        # 后处理 - 逐步调试
         result = self.title_processor.fix_titles(result)
         result = self.ref_processor.fix_references(result)
-        result = self.pseudo_processor.wrap_pseudocode_blocks(result)
+        # 伪代码包裹现在在解析阶段处理，这里做最后的清理
+        result = self._wrap_algorithm_blocks(result)
         result = self._clean_whitespace(result)
         
-        logging.info(f"基础合并: {merged_count} 个块，FSM修复: {self.repair_fsm.repair_count} 个复杂分割")
+        logging.info(f"FSM修复: {len(doc.blocks)} 个块处理完成")
         
         return result
+    
+    def _wrap_algorithm_blocks(self, text: str) -> str:
+        """包裹算法块"""
+        import re
+        
+        # 找到所有算法块的开始位置
+        lines = text.split('\n')
+        result = []
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i]
+            # 检查是否是算法块开始
+            if re.match(r'^\*\*Algorithm\s+\d+\*\*', line):
+                # 收集算法块内容
+                algo_lines = [line]
+                j = i + 1
+                
+                # 继续收集直到遇到空行或新的章节/图片
+                while j < len(lines):
+                    if (not lines[j].strip() or 
+                        lines[j].startswith('#') or 
+                        lines[j].startswith('Fig.') or
+                        lines[j].startswith('Table') or
+                        re.match(r'^\*\*Algorithm\s+\d+\*\*', lines[j])):
+                        break
+                    algo_lines.append(lines[j])
+                    j += 1
+                
+                # 包裹成代码块
+                if len(algo_lines) > 1:
+                    result.append('```')
+                    result.extend(algo_lines)
+                    result.append('```')
+                    i = j
+                else:
+                    result.append(line)
+                    i += 1
+            else:
+                result.append(line)
+                i += 1
+        
+        return '\n'.join(result)
+        
+        def wrap_match(match):
+            content = match.group(0)
+            # 移除开头结尾的 **
+            content = re.sub(r'^\*\*', '', content)
+            content = re.sub(r'\*\*$', '', content)
+            # 包裹在代码块中
+            return f"```\n{content}\n```"
+        
+        # 应用包裹
+        text = re.sub(algorithm_pattern, wrap_match, text, flags=re.DOTALL | re.MULTILINE)
+        
+        return text
     
     def _clean_whitespace(self, text: str) -> str:
         """清理多余空格"""
@@ -814,11 +1229,60 @@ class MarkdownFixer:
         text = text.replace("&lt;", "<")
         text = text.replace("&gt;", ">")
         
+        # 删除论文脚注
+        text = self._remove_paper_footnotes(text)
+        
         # 清理多余空行
         while '\n\n\n' in text:
             text = text.replace('\n\n\n', '\n\n')
         
         return text
+    
+    def _remove_paper_footnotes(self, text: str) -> str:
+        """删除论文期刊脚注"""
+        # 先分离合并的元数据行
+        text = self._separate_merged_metadata(text)
+        
+        # 匹配期刊信息脚注模式
+        patterns = [
+            # 简化的期刊脚注：J. ACM 37, 4, Article 111
+            r'J\.\s*[A-Z]+\s+\d+[,\s]+\d+[,\s]+Article\s+\d+.*?\n?',
+            # 内嵌的期刊脚注：J. ACM, Vol. 37, No. 4, Article 111. Publication date: August 2018.
+            r'J\.\s*[A-Z]+[,\s]+Vol\.\s*\d+[,\s]+No\.\s*\d+[,\s]+.*?Publication date:.*?\d{4}\..*?(?=\s+[A-Z]|\s*$)',
+            # 长标题脚注：### Energy-Efficient and Real-Time FPGA-Based...
+            r'###\s+(?=Energy-Efficient|An Energy-Efficient).*?(?=\n|$)',
+            # 标题形式的期刊脚注
+            r'###\s*J\.\s*[A-Z]+[,\s]+Vol\.\s*\d+[,\s]+No\.\s*\d+[,\s]+.*?Publication date:.*?\d{4}\..*?\n',
+            # ACM 1557-735X/2018/8-ART111
+            r'ACM\s+\d{4}-\d{3}X/\d{4}/\d+-[A-Z0-9]+\s*\n',
+            # © 2018 Copyright held by...
+            r'©\s*\d{4}.*?Copyright.*?\n',
+            # Permission to make digital...
+            r'Permission to make digital.*?permissions@acm\.org\.\s*\n',
+            # https://doi.org/...
+            r'https://doi\.org/[X\.]+\s*\n',
+            # 通用的页眉页脚模式: 作者名 et al.
+            r'###?\s*[A-Z][a-z]+\s+et al\.\s*\n',
+            # 页码模式 111:10, 111:28 等
+            r'\d+:\d+\s*\n',
+        ]
+        
+        for pattern in patterns:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
+        
+        return text
+    
+    def _separate_merged_metadata(self, text: str) -> str:
+        """分离合并的元数据行"""
+        # 匹配 *Generated from PDF*Title 模式 - 修复：确保星号内有内容
+        pattern = r'(\*[^*]+\*)([A-Z][^*]*)'
+        
+        def replace_func(match):
+            metadata = match.group(1)
+            title = match.group(2)
+            return f"{metadata}\n\n{title}"
+        
+        return re.sub(pattern, replace_func, text)
 
 
 # ============================================================================
